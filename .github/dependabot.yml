@@ -4,10 +4,25 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    commit-message:
+        prefix: "deps:"
     reviewers:
-      - "Shopify/infrasec"
+      - "Cyb3r-Jak3"
+
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
-      # Check for updates to GitHub Actions every week
       interval: "weekly"
+    commit-message:
+        prefix: "deps:"
+    reviewers:
+        - "Cyb3r-Jak3"
+
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+        prefix: "deps:"
+    reviewers:
+      - "Cyb3r-Jak3"

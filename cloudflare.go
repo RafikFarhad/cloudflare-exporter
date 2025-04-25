@@ -5,14 +5,18 @@ import (
 	"strings"
 	"time"
 
-	cloudflare "github.com/cloudflare/cloudflare-go"
+	"github.com/cloudflare/cloudflare-go"
 	"github.com/machinebox/graphql"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
 )
 
-var (
+const (
 	cfGraphQLEndpoint = "https://api.cloudflare.com/client/v4/graphql/"
+)
+
+var (
+	graphqlClient *graphql.Client
 )
 
 type cloudflareResponse struct {
@@ -43,6 +47,35 @@ type cloudflareResponseLogpushAccount struct {
 	Viewer struct {
 		Accounts []logpushResponse `json:"accounts"`
 	} `json:"viewer"`
+}
+
+type r2AccountResp struct {
+	R2StorageGroups []struct {
+		Dimensions struct {
+			BucketName string `json:"bucketName"`
+		} `json:"dimensions"`
+		Max struct {
+			MetadataSize uint64 `json:"metadataSize"`
+			PayloadSize  uint64 `json:"payloadSize"`
+			ObjectCount  uint64 `json:"objectCount"`
+		} `json:"max"`
+	} `json:"r2StorageAdaptiveGroups"`
+
+	R2StorageOperations []struct {
+		Dimensions struct {
+			Action     string `json:"actionType"`
+			BucketName string `json:"bucketName"`
+		} `json:"dimensions"`
+		Sum struct {
+			Requests uint64 `json:"requests"`
+		} `json:"sum"`
+	} `json:"r2OperationsAdaptiveGroups"`
+}
+
+type cloudflareResponseR2Account struct {
+	Viewer struct {
+		Accounts []r2AccountResp `json:"accounts"`
+	}
 }
 
 type cloudflareResponseLogpushZone struct {
@@ -251,44 +284,22 @@ type lbResp struct {
 }
 
 func fetchZones() []cloudflare.Zone {
-	var api *cloudflare.API
-	var err error
-	if len(viper.GetString("cf_api_token")) > 0 {
-		api, err = cloudflare.NewWithAPIToken(viper.GetString("cf_api_token"))
-	} else {
-		api, err = cloudflare.New(viper.GetString("cf_api_key"), viper.GetString("cf_api_email"))
-	}
-	if err != nil {
-		log.Fatal(err)
-	}
-
 	ctx := context.Background()
-	z, err := api.ListZones(ctx)
+	z, err := cloudflareAPI.ListZones(ctx)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("Error fetching zones: %s", err)
 	}
 
 	return z
 }
 
 func fetchFirewallRules(zoneID string) map[string]string {
-	var api *cloudflare.API
-	var err error
-	if len(viper.GetString("cf_api_token")) > 0 {
-		api, err = cloudflare.NewWithAPIToken(viper.GetString("cf_api_token"))
-	} else {
-		api, err = cloudflare.New(viper.GetString("cf_api_key"), viper.GetString("cf_api_email"))
-	}
-	if err != nil {
-		log.Fatal(err)
-	}
-
 	ctx := context.Background()
-	listOfRules, _, err := api.FirewallRules(ctx,
+	listOfRules, _, err := cloudflareAPI.FirewallRules(ctx,
 		cloudflare.ZoneIdentifier(zoneID),
 		cloudflare.FirewallRuleListParams{})
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("Error fetching firewall rules: %s", err)
 	}
 	firewallRulesMap := make(map[string]string)
 
@@ -296,15 +307,15 @@ func fetchFirewallRules(zoneID string) map[string]string {
 		firewallRulesMap[rule.ID] = rule.Description
 	}
 
-	listOfRulesets, err := api.ListRulesets(ctx, cloudflare.ZoneIdentifier(zoneID), cloudflare.ListRulesetsParams{})
+	listOfRulesets, err := cloudflareAPI.ListRulesets(ctx, cloudflare.ZoneIdentifier(zoneID), cloudflare.ListRulesetsParams{})
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("Error listing rulesets: %s", err)
 	}
 	for _, rulesetDesc := range listOfRulesets {
 		if rulesetDesc.Phase == "http_request_firewall_managed" {
-			ruleset, err := api.GetRuleset(ctx, cloudflare.ZoneIdentifier(zoneID), rulesetDesc.ID)
-			if err != nil {
-				log.Fatal(err)
+			ruleset, ruleGetErr := cloudflareAPI.GetRuleset(ctx, cloudflare.ZoneIdentifier(zoneID), rulesetDesc.ID)
+			if ruleGetErr != nil {
+				log.Fatalf("Error fetching ruleset: %s", ruleGetErr)
 			}
 			for _, rule := range ruleset.Rules {
 				firewallRulesMap[rule.ID] = rule.Description
@@ -316,21 +327,10 @@ func fetchFirewallRules(zoneID string) map[string]string {
 }
 
 func fetchAccounts() []cloudflare.Account {
-	var api *cloudflare.API
-	var err error
-	if len(viper.GetString("cf_api_token")) > 0 {
-		api, err = cloudflare.NewWithAPIToken(viper.GetString("cf_api_token"))
-	} else {
-		api, err = cloudflare.New(viper.GetString("cf_api_key"), viper.GetString("cf_api_email"))
-	}
-	if err != nil {
-		log.Fatal(err)
-	}
-
 	ctx := context.Background()
-	a, _, err := api.Accounts(ctx, cloudflare.AccountsListParams{PaginationOptions: cloudflare.PaginationOptions{PerPage: 100}})
+	a, _, err := cloudflareAPI.Accounts(ctx, cloudflare.AccountsListParams{PaginationOptions: cloudflare.PaginationOptions{PerPage: 100}})
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("Error fetching accounts: %s", err)
 	}
 
 	return a
@@ -451,7 +451,6 @@ query ($zoneIDs: [String!], $mintime: Time!, $maxtime: Time!, $limit: Int!) {
 	request.Var("zoneIDs", zoneIDs)
 
 	ctx := context.Background()
-	graphqlClient := graphql.NewClient(cfGraphQLEndpoint)
 
 	var resp cloudflareResponse
 	if err := graphqlClient.Run(ctx, request, &resp); err != nil {
@@ -507,7 +506,6 @@ func fetchColoTotals(zoneIDs []string) (*cloudflareResponseColo, error) {
 	request.Var("zoneIDs", zoneIDs)
 
 	ctx := context.Background()
-	graphqlClient := graphql.NewClient(cfGraphQLEndpoint)
 	var resp cloudflareResponseColo
 	if err := graphqlClient.Run(ctx, request, &resp); err != nil {
 		log.Error(err)
@@ -567,10 +565,9 @@ func fetchWorkerTotals(accountID string) (*cloudflareResponseAccts, error) {
 	request.Var("accountID", accountID)
 
 	ctx := context.Background()
-	graphqlClient := graphql.NewClient(cfGraphQLEndpoint)
 	var resp cloudflareResponseAccts
 	if err := graphqlClient.Run(ctx, request, &resp); err != nil {
-		log.Error(err)
+		log.Errorf("Error fetching worker totals: %s", err)
 		return nil, err
 	}
 
@@ -644,10 +641,9 @@ func fetchLoadBalancerTotals(zoneIDs []string) (*cloudflareResponseLb, error) {
 	request.Var("zoneIDs", zoneIDs)
 
 	ctx := context.Background()
-	graphqlClient := graphql.NewClient(cfGraphQLEndpoint)
 	var resp cloudflareResponseLb
 	if err := graphqlClient.Run(ctx, request, &resp); err != nil {
-		log.Error(err)
+		log.Errorf("Error fetching load balancer totals: %s", err)
 		return nil, err
 	}
 	return &resp, nil
@@ -696,10 +692,9 @@ func fetchLogpushAccount(accountID string) (*cloudflareResponseLogpushAccount, e
 	request.Var("mintime", now1mAgo)
 
 	ctx := context.Background()
-	graphqlClient := graphql.NewClient(cfGraphQLEndpoint)
 	var resp cloudflareResponseLogpushAccount
 	if err := graphqlClient.Run(ctx, request, &resp); err != nil {
-		log.Error(err)
+		log.Errorf("Error fetching logpush account totals: %s", err)
 		return nil, err
 	}
 	return &resp, nil
@@ -748,13 +743,68 @@ func fetchLogpushZone(zoneIDs []string) (*cloudflareResponseLogpushZone, error) 
 	request.Var("mintime", now1mAgo)
 
 	ctx := context.Background()
-	graphqlClient := graphql.NewClient(cfGraphQLEndpoint)
 	var resp cloudflareResponseLogpushZone
 	if err := graphqlClient.Run(ctx, request, &resp); err != nil {
-		log.Error(err)
+		log.Errorf("Error fetching logpush zone totals: %s", err)
 		return nil, err
 	}
 
+	return &resp, nil
+}
+
+func fetchR2Account(accountID string) (*cloudflareResponseR2Account, error) {
+	now := time.Now().Add(-time.Duration(viper.GetInt("scrape_delay")) * time.Second).UTC()
+	s := 60 * time.Second
+	now = now.Truncate(s)
+
+	request := graphql.NewRequest(`query($accountID: String!, $limit: Int!, $date: String!) {
+		viewer {
+		  accounts(filter: {accountTag : $accountID }) {
+			r2StorageAdaptiveGroups(
+			  filter: {
+				date: $date
+			  },
+			  limit: $limit
+			) {
+			  dimensions {
+          		bucketName
+			  }
+        	  max {
+				metadataSize
+          		payloadSize
+				objectCount
+			  }
+      		}
+			r2OperationsAdaptiveGroups(filter: { date: $date }, limit: $limit) {
+				dimensions {
+					actionType
+					bucketName
+				}
+				sum {
+					requests
+				}
+			}
+			}
+		  }
+	  }`)
+
+	if len(viper.GetString("cf_api_token")) > 0 {
+		request.Header.Set("Authorization", "Bearer "+viper.GetString("cf_api_token"))
+	} else {
+		request.Header.Set("X-AUTH-EMAIL", viper.GetString("cf_api_email"))
+		request.Header.Set("X-AUTH-KEY", viper.GetString("cf_api_key"))
+	}
+
+	request.Var("accountID", accountID)
+	request.Var("limit", 9999)
+	request.Var("date", now.Format("2006-01-02"))
+
+	ctx := context.Background()
+	var resp cloudflareResponseR2Account
+	if err := graphqlClient.Run(ctx, request, &resp); err != nil {
+		log.Errorf("Error fetching R2 account: %s", err)
+		return nil, err
+	}
 	return &resp, nil
 }
 
